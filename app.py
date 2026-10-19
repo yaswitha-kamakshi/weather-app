@@ -1,3 +1,4 @@
+import time
 from datetime import datetime
 
 import requests
@@ -115,7 +116,7 @@ PAGE = """
   <div class="card">
     <h1>🌤 Weather App</h1>
 
-    <form method="get" action="/" id="searchForm">
+    <form method="get" action="/" id="searchForm" onsubmit="return cleanForm(this)">
       <input type="text" name="city" placeholder="Enter city name" value="{{ city or '' }}">
       {% if lat and lon and not city %}
         <input type="hidden" name="lat" value="{{ lat }}">
@@ -179,6 +180,13 @@ PAGE = """
       } catch (e) {}
     }
 
+    function cleanForm(form) {
+      if (form.city.value.trim() !== "") {
+        ["lat", "lon"].forEach(function (n) { if (form[n]) { form[n].disabled = true; } });
+      }
+      return true;
+    }
+
     function useMyLocation() {
       var msg = document.getElementById("msg");
       if (!navigator.geolocation) { msg.textContent = "Geolocation is not supported by this browser."; return; }
@@ -199,14 +207,63 @@ PAGE = """
 """
 
 
+class WeatherError(Exception):
+    """Raised with a user-friendly message when the weather service fails."""
+
+
+HEADERS = {"User-Agent": "weather-app-flask/1.0 (student project)"}
+_cache = {}
+
+
+def cache_get(key, ttl):
+    item = _cache.get(key)
+    if item and time.time() - item[0] < ttl:
+        return item[1]
+    return None
+
+
+def cache_set(key, value):
+    if len(_cache) > 500:
+        _cache.clear()
+    _cache[key] = (time.time(), value)
+    return value
+
+
+def fetch_json(url, params):
+    """GET a URL with retries; raise WeatherError with a clear message on failure."""
+    last = None
+    for attempt in range(3):
+        try:
+            r = requests.get(url, params=params, headers=HEADERS, timeout=15)
+            if r.status_code == 429 or r.status_code >= 500:
+                app.logger.warning("Weather API returned %s for %s", r.status_code, url)
+                last = WeatherError("The weather service is busy right now. Please try again in a minute.")
+            else:
+                r.raise_for_status()
+                return r.json()
+        except requests.exceptions.Timeout:
+            app.logger.warning("Timeout calling %s", url)
+            last = WeatherError("The weather service took too long to respond. Please try again.")
+        except requests.exceptions.RequestException as e:
+            app.logger.warning("Request to %s failed: %s", url, e)
+            last = WeatherError("Could not reach the weather service. Please try again shortly.")
+        if attempt < 2:
+            time.sleep(1 + attempt)
+    raise last
+
+
 def get_coordinates(city):
-    r = requests.get(GEOCODE_URL, params={"name": city, "count": 1}, timeout=10)
-    r.raise_for_status()
-    results = r.json().get("results")
+    key = ("geo", city.lower())
+    cached = cache_get(key, 86400)
+    if cached is not None:
+        return cached or None
+    data = fetch_json(GEOCODE_URL, {"name": city, "count": 1})
+    results = data.get("results")
     if not results:
+        cache_set(key, False)
         return None
     p = results[0]
-    return p["latitude"], p["longitude"], p["name"], p.get("country", "")
+    return cache_set(key, (p["latitude"], p["longitude"], p["name"], p.get("country", "")))
 
 
 def get_weather(lat, lon, unit):
@@ -222,9 +279,11 @@ def get_weather(lat, lon, unit):
         "temperature_unit": "fahrenheit" if unit == "f" else "celsius",
         "wind_speed_unit": "mph" if unit == "f" else "kmh",
     }
-    r = requests.get(WEATHER_URL, params=params, timeout=10)
-    r.raise_for_status()
-    return r.json()
+    key = ("wx", round(lat, 2), round(lon, 2), unit)
+    cached = cache_get(key, 600)  # reuse results for 10 minutes
+    if cached is not None:
+        return cached
+    return cache_set(key, fetch_json(WEATHER_URL, params))
 
 
 def build_weather(name, country, data):
@@ -304,8 +363,8 @@ def home():
         if lat is not None and lon is not None and not error:
             data = get_weather(lat, lon, unit)
             weather, theme = build_weather(name, country, data)
-    except requests.exceptions.RequestException:
-        error = "Network error. Check your internet connection."
+    except WeatherError as e:
+        error = str(e)
 
     return render_template_string(
         PAGE,
