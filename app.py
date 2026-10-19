@@ -1,3 +1,4 @@
+import os
 import time
 from datetime import datetime
 
@@ -229,12 +230,16 @@ def cache_set(key, value):
     return value
 
 
-def fetch_json(url, params):
+def fetch_json(url, params, bad_request_msg=None):
     """GET a URL with retries; raise WeatherError with a clear message on failure."""
     last = None
     for attempt in range(3):
         try:
             r = requests.get(url, params=params, headers=HEADERS, timeout=15)
+            if r.status_code == 400 and bad_request_msg:
+                raise WeatherError(bad_request_msg)
+            if r.status_code in (401, 403):
+                raise WeatherError("The weather API key is missing, invalid or disabled.")
             if r.status_code == 429 or r.status_code >= 500:
                 app.logger.warning("Weather API returned %s for %s", r.status_code, url)
                 last = WeatherError("The weather service is busy right now. Please try again in a minute.")
@@ -245,7 +250,7 @@ def fetch_json(url, params):
             app.logger.warning("Timeout calling %s", url)
             last = WeatherError("The weather service took too long to respond. Please try again.")
         except requests.exceptions.RequestException as e:
-            app.logger.warning("Request to %s failed: %s", url, e)
+            app.logger.warning("Request to %s failed: %s", url, type(e).__name__)
             last = WeatherError("Could not reach the weather service. Please try again shortly.")
         if attempt < 2:
             time.sleep(1 + attempt)
@@ -284,6 +289,79 @@ def get_weather(lat, lon, unit):
     if cached is not None:
         return cached
     return cache_set(key, fetch_json(WEATHER_URL, params))
+
+
+# ---------- Optional provider: WeatherAPI.com (used when WEATHERAPI_KEY is set) ----------
+API_KEY = os.environ.get("WEATHERAPI_KEY", "").strip()
+WEATHERAPI_URL = "https://api.weatherapi.com/v1/forecast.json"
+
+# WeatherAPI condition code -> WMO-style code used by this app
+WA_TO_WMO = {
+    1000: 0, 1003: 2, 1006: 3, 1009: 3, 1030: 45, 1135: 45, 1147: 48,
+    1063: 61, 1150: 51, 1153: 51, 1168: 53, 1171: 55,
+    1180: 61, 1183: 61, 1186: 63, 1189: 63, 1192: 65, 1195: 65,
+    1198: 66, 1201: 67, 1204: 66, 1207: 67, 1072: 51,
+    1066: 71, 1114: 73, 1117: 75, 1210: 71, 1213: 71, 1216: 73, 1219: 73,
+    1222: 75, 1225: 75, 1237: 77, 1069: 66,
+    1240: 80, 1243: 81, 1246: 82,
+    1249: 85, 1252: 86, 1255: 85, 1258: 86, 1261: 85, 1264: 86,
+    1087: 95, 1273: 95, 1276: 95, 1279: 95, 1282: 95,
+}
+
+
+def wa_time(value):
+    """WeatherAPI times can have unpadded hours; return ISO 'YYYY-MM-DDTHH:MM'."""
+    return datetime.strptime(value, "%Y-%m-%d %H:%M").strftime("%Y-%m-%dT%H:%M")
+
+
+def get_weather_weatherapi(query, unit):
+    """Fetch from WeatherAPI.com and reshape to the same structure build_weather expects."""
+    key = ("wa", query.lower(), unit)
+    cached = cache_get(key, 600)
+    if cached is not None:
+        return cached
+
+    data = fetch_json(
+        WEATHERAPI_URL,
+        {"key": API_KEY, "q": query, "days": 3, "aqi": "no", "alerts": "no"},
+        bad_request_msg="City not found. Please try another name.",
+    )
+
+    f = unit == "f"
+    t_key = "temp_f" if f else "temp_c"
+    feel_key = "feelslike_f" if f else "feelslike_c"
+    wind_key = "wind_mph" if f else "wind_kph"
+    max_key = "maxtemp_f" if f else "maxtemp_c"
+    min_key = "mintemp_f" if f else "mintemp_c"
+
+    loc, cur, days = data["location"], data["current"], data["forecast"]["forecastday"]
+
+    hourly = {"time": [], "temperature_2m": [], "weather_code": [],
+              "precipitation_probability": [], "is_day": []}
+    for d in days:
+        for h in d["hour"]:
+            hourly["time"].append(wa_time(h["time"]))
+            hourly["temperature_2m"].append(h[t_key])
+            hourly["weather_code"].append(WA_TO_WMO.get(h["condition"]["code"], 3))
+            hourly["precipitation_probability"].append(h.get("chance_of_rain", 0))
+            hourly["is_day"].append(h["is_day"])
+
+    daily = {"time": [d["date"] for d in days],
+             "temperature_2m_max": [d["day"][max_key] for d in days],
+             "temperature_2m_min": [d["day"][min_key] for d in days],
+             "weather_code": [WA_TO_WMO.get(d["day"]["condition"]["code"], 3) for d in days]}
+
+    current = {"time": wa_time(loc["localtime"]),
+               "temperature_2m": cur[t_key],
+               "apparent_temperature": cur[feel_key],
+               "relative_humidity_2m": cur["humidity"],
+               "wind_speed_10m": cur[wind_key],
+               "weather_code": WA_TO_WMO.get(cur["condition"]["code"], 3),
+               "is_day": cur["is_day"]}
+
+    result = ({"current": current, "hourly": hourly, "daily": daily},
+              loc.get("name", ""), loc.get("country", ""))
+    return cache_set(key, result)
 
 
 def build_weather(name, country, data):
@@ -345,11 +423,12 @@ def home():
     try:
         name, country = "", ""
         if city:
-            location = get_coordinates(city)
-            if not location:
-                error = "City not found. Please try another name."
-            else:
-                lat, lon, name, country = location
+            if not API_KEY:
+                location = get_coordinates(city)
+                if not location:
+                    error = "City not found. Please try another name."
+                else:
+                    lat, lon, name, country = location
         elif lat_arg and lon_arg:
             try:
                 lat, lon = float(lat_arg), float(lon_arg)
@@ -360,9 +439,14 @@ def home():
                 error = "Invalid location."
                 lat = lon = None
 
-        if lat is not None and lon is not None and not error:
-            data = get_weather(lat, lon, unit)
-            weather, theme = build_weather(name, country, data)
+        if not error:
+            if API_KEY and (city or lat is not None):
+                query = city if city else f"{lat:.4f},{lon:.4f}"
+                data, api_name, api_country = get_weather_weatherapi(query, unit)
+                weather, theme = build_weather(api_name or name, api_country, data)
+            elif lat is not None and lon is not None:
+                data = get_weather(lat, lon, unit)
+                weather, theme = build_weather(name, country, data)
     except WeatherError as e:
         error = str(e)
 
